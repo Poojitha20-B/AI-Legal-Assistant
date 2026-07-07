@@ -45,7 +45,7 @@ The system is split across two diagrams: the request flow from the user down to 
 
 ```mermaid
 flowchart TD
-    U[User uploads PDF or asks a question] --> APP[Streamlit UI - app.py]
+    U[User uploads a PDF<br/>or asks a question] --> APP[Streamlit UI - app.py]
     APP -->|on upload| DIRECT[Instant analysis:<br/>summary, clause risk, roles]
     APP -->|on chat message| SEC{security_agent.py<br/>deterministic pre-filter}
     SEC -->|blocked| BLOCKED[Request rejected<br/>+ audit log entry]
