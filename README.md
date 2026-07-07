@@ -39,30 +39,44 @@ A single LLM call asked to "do everything" tends to blend tasks — e.g. answeri
 
 ## 3. Architecture
 
+The system is split across two diagrams: the request flow from the user down to the coordinator, and then the coordinator's fan-out to its five specialists. Splitting it this way keeps each diagram simple enough that nothing overlaps.
+
+### 3.1 Request flow
+
 ```mermaid
 flowchart TD
-    U[User uploads PDF / asks a question] --> APP[Streamlit UI - app.py]
-
-    APP -->|on upload| DIRECT[Direct legal_core calls:<br/>summary, clause detection, roles]
-    APP -->|on chat message| SEC[security_agent.py<br/>deterministic pre-filter]
-
+    U[User uploads PDF or asks a question] --> APP[Streamlit UI - app.py]
+    APP -->|on upload| DIRECT[Instant analysis:<br/>summary, clause risk, roles]
+    APP -->|on chat message| SEC{security_agent.py<br/>deterministic pre-filter}
     SEC -->|blocked| BLOCKED[Request rejected<br/>+ audit log entry]
-    SEC -->|sanitized text + optional disclaimer| COORD[legal_coordinator agent<br/>ADK, Groq llama-3.1-8b]
+    SEC -->|sanitized text + optional disclaimer| COORD[legal_coordinator agent<br/>routes to a specialist]
+```
 
-    COORD -->|routes to exactly one tool| SUB1[document_summarizer]
+Every chat message passes through the deterministic security filter before any LLM sees it. If it's blocked, an audit entry is written and nothing reaches the coordinator. Otherwise the coordinator receives sanitized input and picks exactly one specialist for it, shown below.
+
+### 3.2 Coordinator and specialists
+
+```mermaid
+flowchart TD
+    COORD[legal_coordinator agent<br/>ADK, Groq llama-3.1-8b] --> SUB1[document_summarizer]
     COORD --> SUB2[clause_analyzer]
     COORD --> SUB3[role_extractor]
-    COORD --> SUB4[contract_qa<br/>Groq llama-3.3-70b]
-    COORD --> SUB5[case_law_searcher<br/>Groq llama-3.3-70b]
+    COORD --> SUB4["contract_qa<br/>Groq llama-3.3-70b"]
+    COORD --> SUB5["case_law_searcher<br/>Groq llama-3.3-70b"]
 
-    SUB1 & SUB2 & SUB3 & SUB4 & SUB5 -->|MCP stdio tool call| MCP[mcp_server.py<br/>FastMCP tool server]
+    SUB1 ~~~ SUB2 ~~~ SUB3 ~~~ SUB4 ~~~ SUB5
+
+    SUB1 --> MCP[mcp_server.py<br/>FastMCP tool server]
+    SUB2 --> MCP
+    SUB3 --> MCP
+    SUB4 --> MCP
+    SUB5 --> MCP
 
     MCP --> CORE[legal_core.py<br/>LegalBERT / legal-pegasus /<br/>MiniLM embeddings / clause rules]
     MCP -->|case law only| IK[Indian Kanoon<br/>web scrape via cloudscraper]
-
-    CORE --> MCP --> SUB1 & SUB2 & SUB3 & SUB4 & SUB5 --> COORD --> APP
-    DIRECT --> APP
 ```
+
+*Results flow back the same way they came — specialist → `mcp_server.py` → coordinator → `app.py` — omitted above to keep both diagrams readable.*
 
 **Key design points:**
 
