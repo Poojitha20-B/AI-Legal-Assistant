@@ -1,5 +1,23 @@
+"""
+app.py
+======
+Streamlit front-end for the AI Legal Assistant. This file is the "glue"
+layer: it handles file upload, renders the always-on document analysis
+panels (summary / clauses / roles) by calling legal_core.py directly, and
+hosts the chat interface that routes through the ADK multi-agent system in
+agents.py for open-ended questions.
+
+Two different code paths are deliberately used side by side:
+  - Direct legal_core calls (summary/clauses/roles): these are deterministic
+    or single-purpose enough that going through the full agent/MCP stack
+    would just add latency for no benefit — they run immediately on upload.
+  - agents.run_coordinator_agent (chat box): used for anything requiring
+    routing/judgment about *which* kind of analysis the user wants, since
+    that's exactly the coordinator's job.
+"""
+
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz  # PyMuPDF — used for PDF text extraction
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForQuestionAnswering
 import tempfile
@@ -18,13 +36,30 @@ from legal_core import generate_summary, detect_clauses, extract_people_and_role
 
 st.set_page_config(page_title="AI Legal Assistant - LegalBERT Full Summary", layout="wide")
 
+# Surface a clear, actionable warning in the sidebar immediately if the Groq
+# API key isn't configured, rather than letting the chat feature fail
+# opaquely later when a user first tries to use it.
 if not os.environ.get("GROQ_API_KEY"):
     st.sidebar.error("⚠️ GROQ_API_KEY environment variable is not set. Please export GROQ_API_KEY='your_key' in your terminal before running the application.")
+
+# Loaded at module level (not lazily) since spaCy's model load is fast
+# relative to the transformer models in legal_core, and it's used by
+# extract_document_title-adjacent logic elsewhere in the file.
 nlp_spacy = spacy.load("en_core_web_sm")
-# Device setup
+
+# Device setup — mirrors legal_core.py's DEVICE selection; kept here too
+# since summarize_chunk() below duplicates some of legal_core's summarization
+# logic locally (see note on summarize_chunk).
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def extract_document_title(text):
+    """
+    Heuristic title extraction: scans the first 5 non-empty lines and
+    returns the first one that's long enough (>15 chars) and doesn't look
+    like a page number or URL. Falls back to a generic title if nothing
+    qualifies. Used only for labeling the downloadable summary PDF.
+    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     for line in lines[:5]:  # check first few non-empty lines
         # Skip obvious junk lines (page numbers, urls, etc.)
@@ -32,9 +67,17 @@ def extract_document_title(text):
             return line
     return "Legal Document Summary"
 
+
 from datetime import datetime
 
+
 def create_pdf(text, doc_title):
+    """
+    Renders the generated summary as a styled, downloadable PDF report using
+    FPDF, with a navy header band, document title, executive-summary box,
+    and a disclaimer footer. This is purely presentational — no analysis
+    logic lives here, only layout/formatting of already-computed text.
+    """
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=False)
@@ -88,7 +131,7 @@ def create_pdf(text, doc_title):
     pdf.set_text_color(40, 40, 40)
     pdf.set_fill_color(247, 248, 250)
 
-    # Estimate box height by writing text first at x=15, then drawing box behind — 
+    # Estimate box height by writing text first at x=15, then drawing box behind —
     # simplest robust approach: use multi_cell with fill directly
     pdf.set_x(15)
     pdf.multi_cell(180, 6.5, text, fill=True)
@@ -99,7 +142,9 @@ def create_pdf(text, doc_title):
         pdf.add_page()
 
     # ---- Disclaimer box ----
-    # ---- Disclaimer box ----
+    # Every generated summary carries an explicit "not legal advice"
+    # disclaimer directly in the exported document, not just in the chat UI —
+    # important since this PDF may be shared/printed outside the app context.
     pdf.set_draw_color(200, 200, 200)
     pdf.set_line_width(0.3)
     pdf.set_x(10)
@@ -115,17 +160,42 @@ def create_pdf(text, doc_title):
     pdf.set_text_color(150, 150, 150)
     pdf.cell(0, 10, f"Page {pdf.page_no()}", align="C")
 
+    # FPDF outputs latin-1 by default; errors="replace" swaps any
+    # non-latin-1-encodable character (e.g. some Unicode punctuation from the
+    # LLM output) for a placeholder instead of raising, so PDF export can't
+    # crash on unexpected characters in the generated summary.
     buffer = io.BytesIO(pdf.output(dest="S").encode("latin-1", errors="replace"))
     return buffer
 
-# Extract PDF and return both doc object and page-wise text
+
 def extract_text_from_pdf(uploaded_file):
+    """
+    Opens the uploaded PDF via PyMuPDF (fitz) and returns:
+      - doc: the raw fitz Document object (currently unused by callers beyond
+        unpacking, kept for potential future use e.g. page images/metadata)
+      - pages: a list of per-page extracted text (needed for page-cited QA —
+        see legal_core.get_relevant_context / chat_with_contract)
+      - full_text: all pages concatenated (used for summary/clauses/roles,
+        which don't need page-level granularity)
+    """
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     pages = [page.get_text() for page in doc]
     full_text = "\n".join(pages)
     return doc, pages, full_text
 
+
 def summarize_chunk(chunk):
+    """
+    NOTE: this function duplicates legal_core.generate_summary's per-chunk
+    summarization logic locally, but is not currently called anywhere in
+    this file (the UI's summary panel calls legal_core.generate_summary
+    directly instead, via st.session_state.cached_summary below). Left in
+    place as dead code / a leftover from an earlier iteration where
+    summarization was inlined in app.py before being moved into legal_core.py.
+    Uses adaptive max_length/min_length scaled to the input chunk's token
+    count (rather than fixed values) so short chunks aren't padded into an
+    overly long summary and long chunks aren't clipped too aggressively.
+    """
     inputs = summary_tokenizer(chunk, return_tensors="pt", truncation=True, max_length=1024).to(DEVICE)
     input_len = inputs["input_ids"].shape[1]
 
@@ -153,6 +223,11 @@ def summarize_chunk(chunk):
 
 import cloudscraper
 import agents
+
+# Registers legal_core functions with the agents module's callback registry.
+# Currently an extension point rather than something the agent flow depends
+# on today (see the _callbacks note in agents.py) — the agents actually get
+# this functionality via MCP tool calls (mcp_server.py), not these callbacks.
 agents.register_callback("generate_summary", generate_summary)
 agents.register_callback("detect_clauses", detect_clauses)
 agents.register_callback("extract_people_and_roles", extract_people_and_roles)
@@ -162,6 +237,7 @@ agents.register_callback("indian_kanoon_search", indian_kanoon_search)
 #st.set_page_config(page_title="AI Legal Assistant - LegalBERT Full Summary", layout="wide")
 st.title("⚖️ AI Legal Assistant - LegalBERT Summary & Analysis")
 
+# --- Standalone case-law search box (not gated on a document being uploaded) ---
 st.subheader("🔎 Indian Case Law (via Indian Kanoon)")
 query = st.text_input("Search Indian legal cases:")
 if query:
@@ -174,10 +250,18 @@ pdf = st.file_uploader("📂 Upload a legal PDF document", type=["pdf"])
 
 if pdf:
     doc, page_texts, full_text = extract_text_from_pdf(pdf)
+    # Publishes the newly uploaded document into agents.py's module-level
+    # "active document" state, so any subsequent chat query can be routed to
+    # a subagent with the right {document_text}/{qa_context} available.
     agents.set_active_document(full_text, page_texts)
 
+    # --- Summary panel ---
     st.subheader("📑 Full Document Summary")
     if "cached_summary" not in st.session_state:
+        # Cached in session_state so re-running the summarizer on every
+        # Streamlit rerun (which happens on almost any widget interaction)
+        # is avoided — summarization is the most expensive operation in the
+        # app and should only run once per uploaded document.
         progress_bar = st.progress(0, text="Summarizing document...")
 
         def update_progress(current, total):
@@ -196,11 +280,16 @@ if pdf:
         mime="application/pdf"
     )
 
+    # --- Clause detection / risk panel ---
     st.subheader("📌 Clause Detection & Risk")
     found, missing, risk = detect_clauses(full_text)
     st.success("✅ Found Clauses: " + ", ".join(found))
     st.warning("❌ Missing Clauses: " + ", ".join(missing))
     st.info(f"*⚠️ Risk Score:* {risk} / 10")
+    # Three-tier risk banding gives the user an immediate, plain-language
+    # read on the numeric risk score without needing to interpret it
+    # themselves — thresholds chosen to roughly match "most clauses missing"
+    # vs. "some missing" vs. "few/none missing" given the CLAUSES weights.
     if risk >= 7:
         st.error("🔴 High Risk: Many critical clauses are missing. Consider legal review. 🚫 Not safe to sign without legal advice.")
     elif risk >= 4:
@@ -208,6 +297,7 @@ if pdf:
     else:
         st.success("🟢 Low Risk: Most critical clauses are present. ✅ Document appears safe to sign.")
 
+    # --- Roles panel ---
     st.subheader("👥 People and Their Roles")
     people_roles = extract_people_and_roles(full_text)
 
@@ -217,13 +307,21 @@ if pdf:
     else:
         st.warning("❌ No names or roles found. Check the document format.")
 
-
+    # --- Chat panel: this is the only part of the UI that goes through the
+    # ADK multi-agent coordinator (agents.run_coordinator_agent) rather than
+    # calling legal_core directly, since the coordinator's whole job is
+    # figuring out which kind of question this is. ---
     st.subheader("💬 Legal Assistant Chatbot")
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "rate_limited_until" not in st.session_state:
         st.session_state.rate_limited_until = 0
 
+    # Rate-limit cooldown UI: agents.run_coordinator_agent returns a
+    # {"rate_limited": True, "retry_after_seconds": ...} dict when Groq
+    # returns a 429 (see agents.py). We persist the unlock timestamp in
+    # session_state and disable chat input until it passes, rather than
+    # letting the user immediately re-trigger the same rate limit.
     remaining = st.session_state.rate_limited_until - time.time()
     if remaining > 0:
         mins, secs = divmod(int(remaining), 60)
@@ -240,6 +338,10 @@ if pdf:
                     reply = error_msg
                 else:
                     try:
+                        # This single call triggers: security pre-filtering →
+                        # coordinator routing → subagent execution → MCP tool
+                        # call → legal_core analysis, and returns just the
+                        # final text (or a rate-limit dict) to display.
                         result = agents.run_coordinator_agent(user_input, api_key=api_key)
                     except Exception as e:
                         result = f"⚠️ Error running agent system: {e}"
@@ -253,6 +355,8 @@ if pdf:
                 st.session_state.chat_history.append(("🧑‍💼 You", user_input))
                 st.session_state.chat_history.append(("🤖 LegalBot", reply))
 
+    # Render full chat history on every rerun (Streamlit has no persistent
+    # DOM, so the whole conversation is redrawn from session_state each time).
     for sender, msg in st.session_state.chat_history:
         with st.chat_message("user" if sender == "🧑‍💼 You" else "assistant"):
             st.markdown(msg)
